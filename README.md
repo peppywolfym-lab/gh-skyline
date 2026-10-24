@@ -1,180 +1,211 @@
-# GitHub Skyline (gh-skyline)
+package geometry
 
-A GitHub CLI extension that generates 3D-printable STL files of your GitHub contribution graph.
+import (
+	"math"
 
-## Features
+	"github.com/golang/freetype/truetype"
+	"golang.org/x/image/math/fixed"
+)
 
-- Generate a Binary STL file from GitHub contribution data for 3D printing
-- Customizable year selection (single year and multi-year)
-- Automatic authentication via GitHub CLI or specify a user
-- ASCII art loading preview of contribution data unique to each user and year
+// Point2D represents a flattened 2D vector coordinate.
+type Point2D struct {
+	X, Y float64
+}
 
-| 3D Print                                                                                                   | ASCII Art                                                                                                                               |
-| ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| ![Example GitHub Skyline](https://github.com/user-attachments/assets/ed0fe34e-6825-4eb2-91d7-a0834966dc3a) | ![Example of gh-skyline and ASCII art in the terminal](https://github.com/user-attachments/assets/8ddda088-ac5a-4020-8ae0-ef0d4825f6a1) |
+// Point3D represents a 3D vertex in the mesh.
+type Point3D struct {
+	X, Y, Z float64
+}
 
-## Usage
+// Triangle represents a single 3D facet in STL coordinate space.
+type Triangle struct {
+	Normal     Point3D
+	V1, V2, V3 Point3D
+}
 
-### Prerequisites
+// Generate3DText converts a string into a slice of extruded 3D triangles.
+func Generate3DText(text string, font *truetype.Font, fontSize float64, depth float64) []Triangle {
+	var allTriangles []Triangle
+	var cursorX float64
 
-The extension requires the [`gh` CLI](https://cli.github.com/) to be installed and in the `PATH`. The extension also requires the user to have authenticated via `gh auth`.
+	scale := fixed.Int26_6(fontSize * 64)
+	glyphBuf := &truetype.GlyphBuf{}
 
-### Installing
+	for _, ch := range text {
+		index := font.Index(ch)
+		if err := glyphBuf.Load(font, scale, index, nil); err != nil {
+			continue
+		}
 
-This project is a GitHub CLI extension. After installing the `gh` CLI, from a command-line run:
+		// 1. Convert FreeType Bézier contours into 2D polygon loops
+		contours := extractContours(glyphBuf, cursorX)
 
-```bash
-gh extension install github/gh-skyline
-```
+		// 2. Extrude each contour loop into 3D prisms (front cap, back cap, walls)
+		for _, contour := range contours {
+			if len(contour) < 3 {
+				continue
+			}
+			triangles := extrudeContour(contour, depth)
+			allTriangles = append(allTriangles, triangles...)
+		}
 
-### Extension Flags
+		// Advance cursor for next character
+		advance := float64(font.HMetric(scale, index).AdvanceWidth) / 64.0
+		cursorX += advance
+	}
 
-You can run the `gh skyline` command with the following flags:
+	return allTriangles
+}
 
-- `-d`, `--debug`: Enable debug logging for more detailed output.
-  - Example: `gh skyline --debug`
-- `-h`, `--help`: Show help for the command.
-  - Example: `gh skyline --help`
-- `-f`, `--full`: Generate the contribution graph from the user's join year to the current year.
-  - Example: `gh skyline --full`
-- `-o`, `--output`: Specify the output filename. If not provided, the default is `{username}-{year}-github-skyline.stl`.
-  - Example: `gh skyline --output my-skyline.stl`
-- `-u`, `--user`: Specify the GitHub username. If not provided, the authenticated user is used.
-  - Example: `gh skyline --user mona`
-- `-y`, `--year`: Specify the year or range of years for the skyline. Must be between 2008 and the current year.
-  - Examples: `gh skyline --year 2020`, `gh skyline --year 2014-2024`
-- `-w`, `--web`: Open the GitHub profile for the authenticated or specified user.
-  - Example: `gh skyline --web`, `gh skyline --user mona --web`
-- `-a`, `--art-only`: Show the ASCII art preview without generating an STL file.
+// extractContours samples quadratic Bézier curves into linear 2D segment loops.
+func extractContours(gb *truetype.GlyphBuf, offsetX float64) [][]Point2D {
+	var contours [][]Point2D
+	start := 0
 
-### Examples
+	for _, end := range gb.Ends {
+		var loop []Point2D
+		points := gb.Points[start:end]
+		n := len(points)
+		if n == 0 {
+			start = end
+			continue
+		}
 
-Generate a skyline STL file that defaults to the current year for the authenticated user:
+		for i := 0; i < n; i++ {
+			curr := points[i]
+			next := points[(i+1)%n]
 
-```bash
-gh skyline
-```
+			currX := float64(curr.X)/64.0 + offsetX
+			currY := float64(curr.Y) / 64.0
 
-Generate a skyline for a specific year for the authenticated user:
+			// On-curve point: append straight line
+			if (curr.Flags & 1) != 0 {
+				loop = append(loop, Point2D{X: currX, Y: currY})
+			} else {
+				// Off-curve control point: sample quadratic Bézier B(t) = (1-t)^2 P0 + 2(1-t)t P1 + t^2 P2
+				prev := points[(i-1+n)%n]
+				p0 := Point2D{X: float64(prev.X)/64.0 + offsetX, Y: float64(prev.Y) / 64.0}
+				p1 := Point2D{X: currX, Y: currY}
+				p2 := Point2D{X: float64(next.X)/64.0 + offsetX, Y: float64(next.Y) / 64.0}
 
-```bash
-gh skyline --year 2023
-```
+				steps := 5
+				for s := 1; s <= steps; s++ {
+					t := float64(s) / float64(steps)
+					it := 1.0 - t
+					bx := it*it*p0.X + 2*it*t*p1.X + t*t*p2.X
+					by := it*it*p0.Y + 2*it*t*p1.Y + t*t*p2.Y
+					loop = append(loop, Point2D{X: bx, Y: by})
+				}
+			}
+		}
 
-Generate a skyline for a specific user and year:
+		contours = append(contours, loop)
+		start = end
+	}
 
-```bash
-gh skyline --user mona --year 2023
-```
+	return contours
+}
 
-Generate a skyline for a range of years for the authenticated user:
+// extrudeContour builds front/back caps via ear-clipping and connects side walls.
+func extrudeContour(poly []Point2D, depth float64) []Triangle {
+	var triangles []Triangle
+	n := len(poly)
 
-```bash
-gh skyline --year 2014-2024
-```
+	// --- 1. Side Walls (Perimeter Quads -> 2 Triangles each) ---
+	for i := 0; i < n; i++ {
+		next := (i + 1) % n
 
-Generate a skyline from the user's join year to the current year:
+		p1Back := Point3D{X: poly[i].X, Y: poly[i].Y, Z: 0}
+		p2Back := Point3D{X: poly[next].X, Y: poly[next].Y, Z: 0}
+		p1Front := Point3D{X: poly[i].X, Y: poly[i].Y, Z: depth}
+		p2Front := Point3D{X: poly[next].X, Y: poly[next].Y, Z: depth}
 
-```bash
-gh skyline --full
-```
+		triangles = append(triangles,
+			makeFacet(p1Back, p2Back, p2Front),
+			makeFacet(p1Back, p2Front, p1Front),
+		)
+	}
 
-Generate only the ASCII preview for a skyline:
+	// --- 2. Front & Back Caps (Ear Clipping Triangulation) ---
+	indices := triangulate2D(poly)
+	for i := 0; i < len(indices); i += 3 {
+		i1, i2, i3 := indices[i], indices[i+1], indices[i+2]
 
-```bash
-gh skyline --art-only
-```
+		// Front cap (Z = depth, counter-clockwise outward normal)
+		triangles = append(triangles, makeFacet(
+			Point3D{X: poly[i1].X, Y: poly[i1].Y, Z: depth},
+			Point3D{X: poly[i2].X, Y: poly[i2].Y, Z: depth},
+			Point3D{X: poly[i3].X, Y: poly[i3].Y, Z: depth},
+		))
 
-Enable debug logging:
+		// Back cap (Z = 0, clockwise reversed for downward outward normal)
+		triangles = append(triangles, makeFacet(
+			Point3D{X: poly[i1].X, Y: poly[i1].Y, Z: 0},
+			Point3D{X: poly[i3].X, Y: poly[i3].Y, Z: 0},
+			Point3D{X: poly[i2].X, Y: poly[i2].Y, Z: 0},
+		))
+	}
 
-```bash
-gh skyline --debug
-```
+	return triangles
+}
 
-By default, the CLI will create a `{username}-{year}-github-skyline.stl` file in your current directory. You can specify a different filename using the `--output` flag.
+// triangulate2D implements basic ear-clipping for simple planar polygons.
+func triangulate2D(pts []Point2D) []int {
+	n := len(pts)
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
 
-```bash
-gh skyline --output my-skyline.stl
-```
+	var result []int
+	for len(idx) > 2 {
+		found := false
+		count := len(idx)
+		for i := 0; i < count; i++ {
+			prev := idx[(i-1+count)%count]
+			curr := idx[i]
+			next := idx[(i+1)%count]
 
-Open the GitHub profile for the authenticated user:
+			if isConvex(pts[prev], pts[curr], pts[next]) {
+				result = append(result, prev, curr, next)
+				idx = append(idx[:i], idx[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Fallback fan if ear test terminates early on degenerate loop
+			for j := 1; j < len(idx)-1; j++ {
+				result = append(result, idx[0], idx[j], idx[j+1])
+			}
+			break
+		}
+	}
+	return result
+}
 
-```bash
-gh skyline --web
-```
+func isConvex(a, b, c Point2D) bool {
+	return (b.X-a.X)*(c.Y-b.Y)-(b.Y-a.Y)*(c.X-b.X) > 0
+}
 
-Open the GitHub profile for a specific user:
+// makeFacet creates a triangle facet and computes its unit normal vector via cross product.
+func makeFacet(v1, v2, v3 Point3D) Triangle {
+	ax, ay, az := v2.X-v1.X, v2.Y-v1.Y, v2.Z-v1.Z
+	bx, by, bz := v3.X-v1.X, v3.Y-v1.Y, v3.Z-v1.Z
 
-```bash
-gh skyline --user mona --web
-```
+	nx := ay*bz - az*by
+	ny := az*bx - ax*bz
+	nz := ax*by - ay*bx
 
-## ASCII Art
+	lenVal := math.Sqrt(nx*nx + ny*ny + nz*nz)
+	if lenVal > 0 {
+		nx, ny, nz = nx/lenVal, ny/lenVal, nz/lenVal
+	}
 
-The extension generates ASCII art in terminal while loading, a unique and fun way to visualise your contribution data while you wait! Each column represents one week. Days within each week are reordered vertically to create a "building" effect, with empty spaces (no contributions) at the top.
-
-- `' '` Empty/Sky: No contributions
-- `'.'` Future dates: What contributions could you make?
-- `'░'` Low level: Light contribution activity
-- `'▒'` Medium level: Moderate contribution activity
-- `'▓'` High level: Heavy contribution activity
-- `'╻┃╽'` Top level: Last block with contributions in the week (Low, Medium, High)
-
-## Visualizing your Skyline
-
-Once you have generated your STL file, you can visualize it using 3D modeling or 3D printing software. But did you know that you can upload your STL file to a GitHub repository and view your Skyline there? For example, take a look at [@chrisreddington's GitHub Skyline from 2011 - 2024](https://github.com/chrisreddington/chrisreddington/blob/master/chrisreddington-11-24-github-skyline.stl).
-
-## Project Structure
-
-```text
-├── ascii/
-│   ├── block.go: ASCII block character definitions for contribution levels
-│   ├── block_test.go: Block character unit tests
-│   ├── generator.go: Contribution visualization ASCII art generation
-│   ├── generator_test.go: ASCII generation tests
-│   ├── text.go: ASCII text formatting utilities
-│   └── text_test.go: Text formatting unit tests
-├── errors/
-│   ├── errors.go: Custom error types and domain-specific error handling
-│   └── errors_test.go: Error handling unit tests
-├── github/
-│   ├── client.go: GitHub API client for fetching contribution data
-│   └── client_test.go: API client unit tests
-├── logger/
-│   ├── logger.go: Thread-safe logging with severity levels
-│   └── logger_test.go: Logger unit tests
-├── stl/
-│   ├── generator.go: STL 3D model generation from contribution data
-│   ├── generator_test.go: Model generation unit tests
-│   ├── stl.go: STL binary file format implementation
-│   ├── stl_test.go: STL file generation tests
-│   └── geometry/
-│       ├── geometry.go: 3D geometry calculations and transformations
-│       ├── geometry_test.go: Geometry unit tests
-│       ├── shapes.go: Basic 3D primitive shape definitions
-│       ├── text.go: 3D text geometry generation
-│       └── text_test.go: Text geometry unit tests
-├── types/
-│   ├── types.go: Shared data structures and interfaces
-│   └── types_test.go: Data structure unit tests
-└── main.go: CLI application entry point
-```
-
-## Contributing
-
-To contribute to the project, please read the instructions and contributing guidelines in [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## License
-
-This project is licensed under the terms of the MIT open source license. Please refer to [MIT](./LICENSE) for the full terms.
-
-Mona Sans is licensed under the [SIL Open Font License v1.1](https://scripts.sil.org/OFL). Find more details at [github/mona-sans](https://github.com/github/mona-sans).
-
-[golang/freetype](https://github.com/golang/freetype) is used as a dependency. Portions of this software are copyright © 2024 The FreeType Project ([www.freetype.org](https://www.freetype.org)). All rights reserved.
-
-## Acknowledgements
-
-- The Invertocat is subject to [GitHub Logos and Usage guidelines](https://github.com/logos).
-- The [Mona Sans](https://github.com/github/mona-sans) typeface.
-- The [GitHub CLI](https://cli.github.com/) team for the CLI and extension framework.
-- [golang/freetype](https://github.com/golang/freetype).
+	return Triangle{
+		Normal: Point3D{X: nx, Y: ny, Z: nz},
+		V1:     v1,
+		V2:     v2,
+		V3:     v3,
+	}
+}
